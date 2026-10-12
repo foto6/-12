@@ -1,4 +1,4 @@
-name: TGWS Android CF fallback preview APK
+name: TGWS Android handshake fix preview APK
 
 on:
   push:
@@ -34,18 +34,20 @@ jobs:
           set -euo pipefail
           git -C tgws apply --check "$GITHUB_WORKSPACE/patches/tg-ws-proxy-android/2026-10-12-cf-fallback.patch"
           git -C tgws apply "$GITHUB_WORKSPACE/patches/tg-ws-proxy-android/2026-10-12-cf-fallback.patch"
+          git -C tgws apply --check "$GITHUB_WORKSPACE/patches/tg-ws-proxy-android/2026-10-12-runtime-secret-reapply.patch"
+          git -C tgws apply "$GITHUB_WORKSPACE/patches/tg-ws-proxy-android/2026-10-12-runtime-secret-reapply.patch"
           python3 - <<'PY'
           from pathlib import Path
           p=Path("tgws/app/build.gradle.kts")
           data=p.read_text()
           old='applicationId = "com.amurcanov.tgwsproxy"'
           assert data.count(old)==1, "upstream package changed"
-          p.write_text(data.replace(old, 'applicationId = "com.foto6.tgwsproxy.fixed"'))
+          p.write_text(data.replace(old, 'applicationId = "com.foto6.tgwsproxy.fixed.v2"'))
           for locale in ["values","values-ru"]:
               s=Path(f"tgws/app/src/main/res/{locale}/strings.xml")
               t=s.read_text()
               import re
-              t,n=re.subn(r'(<string name="app_name">)[^<]*(</string>)',r'\1TGWS CF Fix Preview\2',t)
+              t,n=re.subn(r'(<string name="app_name">)[^<]*(</string>)',r'\1TGWS Handshake Fix v2\2',t)
               if n: s.write_text(t)
           PY
           git -C tgws diff --check
@@ -95,7 +97,7 @@ jobs:
           test -s app/build/outputs/apk/arm64/debug/app-arm64-debug.apk
           unzip -l app/build/outputs/apk/arm64/debug/app-arm64-debug.apk | grep -F "lib/arm64-v8a/libtgwsproxy.so"
           mkdir -p "$GITHUB_WORKSPACE/release"
-          cp app/build/outputs/apk/arm64/debug/app-arm64-debug.apk "$GITHUB_WORKSPACE/release/TGWS-CF-Fix-Preview-2026-10-12-arm64.apk"
+          cp app/build/outputs/apk/arm64/debug/app-arm64-debug.apk "$GITHUB_WORKSPACE/release/TGWS-Handshake-Fix-2026-10-12-arm64.apk"
           cd "$GITHUB_WORKSPACE/release"
           sha256sum *.apk | tee SHA256SUMS.txt
 
@@ -112,11 +114,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="tgws-cf-fix-preview-20261012"
+          TAG="tgws-handshake-fix-preview-20261012"
           gh release create "$TAG" \
-            "release/TGWS-CF-Fix-Preview-2026-10-12-arm64.apk" \
+            "release/TGWS-Handshake-Fix-2026-10-12-arm64.apk" \
             "release/SHA256SUMS.txt" \
             --target "$GITHUB_SHA" \
-            --title "TGWS CF Fix Preview (arm64, 2026-10-12)" \
+            --title "TGWS Handshake Fix Preview v2 (arm64, 2026-10-12)" \
             --prerelease \
-            --notes "Experimental Android arm64 APK of amurcanov/tg-ws-proxy-android with bounded Cloudflare fallback. Separate package (com.foto6.tgwsproxy.fixed) to preserve the upstream app. Debug-signed by GitHub Actions: not an update of the upstream APK; no on-device network test has been performed. Stop the original proxy before starting preview to avoid port 1443 conflict. Upstream repo and patch links are in the branch README."
+            --notes "Experimental Android arm64 APK based on amurcanov/tg-ws-proxy-android. Adds native active-secret Telegram link and warning about old local proxy entries, plus bounded CF fallback. This v2 uses another package ID because CI debug builds lack a stable signing key: com.foto6.tgwsproxy.fixed.v2. Stop older proxies (port 1443), remove stale 127.0.0.1 entries in Telegram and apply from this preview. No device verification. Network/Cloudflare blocks may still cause connection failures."
