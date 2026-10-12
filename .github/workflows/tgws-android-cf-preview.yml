@@ -1,0 +1,122 @@
+name: TGWS Android CF fallback preview APK
+
+on:
+  push:
+    branches:
+      - release/tgws-cf-preview-20261012
+    paths:
+      - ".github/workflows/tgws-android-cf-preview.yml"
+      - "patches/tg-ws-proxy-android/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout patch branch
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream Android source
+        uses: actions/checkout@v4
+        with:
+          repository: amurcanov/tg-ws-proxy-android
+          ref: main
+          path: tgws
+          persist-credentials: false
+
+      - name: Apply patch and isolate preview from installed app
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C tgws apply --check "$GITHUB_WORKSPACE/patches/tg-ws-proxy-android/2026-10-12-cf-fallback.patch"
+          git -C tgws apply "$GITHUB_WORKSPACE/patches/tg-ws-proxy-android/2026-10-12-cf-fallback.patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("tgws/app/build.gradle.kts")
+          data=p.read_text()
+          old='applicationId = "com.amurcanov.tgwsproxy"'
+          assert data.count(old)==1, "upstream package changed"
+          p.write_text(data.replace(old, 'applicationId = "com.foto6.tgwsproxy.fixed"'))
+          for locale in ["values","values-ru"]:
+              s=Path(f"tgws/app/src/main/res/{locale}/strings.xml")
+              t=s.read_text()
+              import re
+              t,n=re.subn(r'(<string name="app_name">)[^<]*(</string>)',r'\1TGWS CF Fix Preview\2',t)
+              if n: s.write_text(t)
+          PY
+          git -C tgws diff --check
+          grep -Fq "let mut attempts = tokio::task::JoinSet::new();" tgws/src/proxy.rs
+
+      - name: Prepare Java and Gradle
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.6.0"
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018" "platforms;android-35"
+          test -f "$SDK/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          echo "NDK_BIN=$SDK/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
+
+      - name: Prepare Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Compile patched Rust native library
+        working-directory: tgws
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android24-clang"
+          export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+          cargo build --locked --release --target aarch64-linux-android
+          install -Dm755 target/aarch64-linux-android/release/libtgwsproxy.so app/src/main/jniLibs/arm64-v8a/libtgwsproxy.so
+
+      - name: Build signed, side-by-side installable Android APK
+        working-directory: tgws
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle :app:assembleArm64Debug --no-daemon --stacktrace
+          test -s app/build/outputs/apk/arm64/debug/app-arm64-debug.apk
+          unzip -l app/build/outputs/apk/arm64/debug/app-arm64-debug.apk | grep -F "lib/arm64-v8a/libtgwsproxy.so"
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          cp app/build/outputs/apk/arm64/debug/app-arm64-debug.apk "$GITHUB_WORKSPACE/release/TGWS-CF-Fix-Preview-2026-10-12-arm64.apk"
+          cd "$GITHUB_WORKSPACE/release"
+          sha256sum *.apk | tee SHA256SUMS.txt
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgws-cf-fix-preview-arm64
+          path: release/
+          if-no-files-found: error
+
+      - name: Publish pre-release APK
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="tgws-cf-fix-preview-20261012"
+          gh release create "$TAG" \
+            "release/TGWS-CF-Fix-Preview-2026-10-12-arm64.apk" \
+            "release/SHA256SUMS.txt" \
+            --target "$GITHUB_SHA" \
+            --title "TGWS CF Fix Preview (arm64, 2026-10-12)" \
+            --prerelease \
+            --notes "Experimental Android arm64 APK of amurcanov/tg-ws-proxy-android with bounded Cloudflare fallback. Separate package (com.foto6.tgwsproxy.fixed) to preserve the upstream app. Debug-signed by GitHub Actions: not an update of the upstream APK; no on-device network test has been performed. Stop the original proxy before starting preview to avoid port 1443 conflict. Upstream repo and patch links are in the branch README."
