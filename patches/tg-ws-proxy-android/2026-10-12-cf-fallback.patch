@@ -1,0 +1,175 @@
+--- a/src/proxy.rs
++++ b/src/proxy.rs
+@@ -1254,88 +1254,90 @@
+ }
+ 
+ // Только устанавливает WS-соединение через CF, НЕ трогая conn.
+-async fn cfproxy_acquire_ws(
+-    dc: i32,
+-    is_media: bool,
+-    ws_path: &str,
+-    cancel_token: &CancellationToken,
+-) -> Option<(RawWebSocket, String)> {
+-    let (enabled, domains) = {
+-        let cfg = CFPROXY.read();
+-        (
+-            CFPROXY_ENABLED.load(Ordering::Relaxed),
+-            cfg.domains.clone(),
+-        )
+-    };
+-    if !enabled || domains.is_empty() {
+-        return None;
+-    }
+-
+-    let ordered = crate::balancer::BALANCER.read().get_domains_for_dc(dc);
+-    if ordered.is_empty() {
+-        return None;
+-    }
+-
+-    let m_tag = if is_media { " media" } else { "" };
+-    ldebug!(" CF fallback DC{}{}: {} домен(ов)", dc, m_tag, ordered.len());
+-
+-    let mut ws: Option<RawWebSocket> = None;
+-    let mut chosen_domain = String::new();
+-
+-    if !ordered.is_empty() && !ordered[0].is_empty() {
+-        let (w, d) = try_cfproxy_base_domain(dc, &ordered[0], ws_path).await;
+-        ws = w;
+-        chosen_domain = d;
+-    }
+-
+-    if ws.is_none() && ordered.len() > 1 {
+-        let remaining_domains: Vec<String> = ordered[1..].to_vec();
+-        let sem = Arc::new(tokio::sync::Semaphore::new(CFPROXY_FALLBACK_PARALLEL));
+-        let mut handles = Vec::new();
+-        for bd in remaining_domains {
+-            let sem = sem.clone();
+-            let cancel = cancel_token.clone();
+-            let ws_path = ws_path.to_string();
+-            handles.push(tokio::spawn(async move {
+-                tokio::select! {
+-                    _ = cancel.cancelled() => None,
+-                    r = async {
+-                        let _p = sem.acquire().await.ok()?;
+-                        let (w, d) = try_cfproxy_base_domain(dc, &bd, &ws_path).await;
+-                        w.map(|ws| (ws, d))
+-                    } => r,
+-                }
+-            }));
+-        }
+-        for h in handles {
+-            if let Ok(Some((w, d))) = h.await {
+-                if ws.is_none() {
+-                    ws = Some(w);
+-                    chosen_domain = d;
+-                } else {
+-                    tokio::spawn(async move {
+-                        w.close().await;
+-                    });
+-                }
+-            }
+-        }
+-    }
+-
+-    match ws {
+-        Some(w) => {
+-            if !chosen_domain.is_empty() {
+-                if crate::balancer::BALANCER.write().update_domain_for_dc(dc, &chosen_domain) {
+-                    linfo!(" CF домен для DC{} -> {}", dc, chosen_domain);
+-                }
+-            }
+-            Some((w, chosen_domain))
+-        }
+-        None => {
+-            lwarn!(" CF fallback DC{}{}: все CF домены недоступны", dc, m_tag);
+-            None
+-        }
+-    }
+-}
++async fn cfproxy_acquire_ws(
++    dc: i32,
++    is_media: bool,
++    ws_path: &str,
++    cancel_token: &CancellationToken,
++) -> Option<(RawWebSocket, String)> {
++    let (enabled, domains) = {
++        let cfg = CFPROXY.read();
++        (
++            CFPROXY_ENABLED.load(Ordering::Relaxed),
++            cfg.domains.clone(),
++        )
++    };
++    if !enabled || domains.is_empty() {
++        return None;
++    }
++
++    let ordered = crate::balancer::BALANCER.read().get_domains_for_dc(dc);
++    if ordered.is_empty() {
++        return None;
++    }
++
++    let m_tag = if is_media { " media" } else { "" };
++    ldebug!(" CF fallback DC{}{}: {} домен(ов)", dc, m_tag, ordered.len());
++
++    // Race CF domains instead of awaiting handles in insertion order.
++    // Cap the fallback stage so unavailable CF domains cannot stall Telegram.
++    let sem = Arc::new(tokio::sync::Semaphore::new(CFPROXY_FALLBACK_PARALLEL));
++    let mut attempts = tokio::task::JoinSet::new();
++    for bd in ordered {
++        if bd.is_empty() {
++            continue;
++        }
++        let sem = sem.clone();
++        let ws_path = ws_path.to_string();
++        attempts.spawn(async move {
++            let _permit = sem.acquire_owned().await.ok()?;
++            let (ws, domain) = try_cfproxy_base_domain(dc, &bd, &ws_path).await;
++            ws.map(|ws| (ws, domain))
++        });
++    }
++
++    let mut ws: Option<RawWebSocket> = None;
++    let mut chosen_domain = String::new();
++    let deadline = tokio::time::sleep(Duration::from_secs(12));
++    tokio::pin!(deadline);
++
++    while !attempts.is_empty() {
++        tokio::select! {
++            _ = cancel_token.cancelled() => {
++                break;
++            }
++            _ = &mut deadline => {
++                lwarn!(" CF fallback DC{}{}: deadline 12s exceeded", dc, m_tag);
++                break;
++            }
++            result = attempts.join_next() => {
++                if let Some(Ok(Some((connected_ws, domain)))) = result {
++                    ws = Some(connected_ws);
++                    chosen_domain = domain;
++                    break;
++                }
++            }
++        }
++    }
++
++    // Stop in-flight/queued attempts on success, cancellation or deadline.
++    attempts.abort_all();
++
++    match ws {
++        Some(w) => {
++            if !chosen_domain.is_empty() {
++                if crate::balancer::BALANCER.write().update_domain_for_dc(dc, &chosen_domain) {
++                    linfo!(" CF домен для DC{} -> {}", dc, chosen_domain);
++                }
++            }
++            Some((w, chosen_domain))
++        }
++        None => {
++            lwarn!(" CF fallback DC{}{}: все CF домены недоступны", dc, m_tag);
++            None
++        }
++    }
++}
+ 
+ // ---------------------------------------------------------------------------
+ // doFallback — порт bridge.do_fallback: cf_worker -> cf -> tcp.
